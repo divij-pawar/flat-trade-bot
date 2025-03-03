@@ -3,6 +3,7 @@ import numpy as np
 import time
 import logging
 from datetime import datetime
+import trading_core  # Import our C extension module
 
 # Configure logging
 logging.basicConfig(
@@ -28,6 +29,8 @@ class TradingBot:
         self.api_key = api_key
         self.api_secret = api_secret
         self.is_running = False
+        self.max_position_percent = 0.05  # Max 5% of capital per position
+        self.max_volatility = 0.05  # Max 5% volatility
         logger.info(f"Trading bot initialized with ${initial_capital} capital")
     
     def connect_to_exchange(self, exchange_name):
@@ -76,7 +79,7 @@ class TradingBot:
     
     def calculate_indicators(self, data):
         """
-        Calculate technical indicators on market data
+        Calculate technical indicators on market data using C extension
         
         Args:
             data (pd.DataFrame): Market data
@@ -84,31 +87,28 @@ class TradingBot:
         Returns:
             pd.DataFrame: Market data with added indicators
         """
-        logger.info("Calculating technical indicators")
+        logger.info("Calculating technical indicators using C extension")
         df = data.copy()
         
-        # Simple Moving Averages
-        df['sma20'] = df['close'].rolling(window=20).mean()
-        df['sma50'] = df['close'].rolling(window=50).mean()
+        # Convert to numpy arrays for C functions
+        close_prices = df['close'].values.astype(np.float64)
         
-        # Relative Strength Index (RSI)
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df['rsi'] = 100 - (100 / (1 + rs))
+        # Calculate indicators using C extension
+        df['sma20'] = trading_core.calculate_sma(close_prices, 20)
+        df['sma50'] = trading_core.calculate_sma(close_prices, 50)
+        df['ema12'] = trading_core.calculate_ema(close_prices, 12)
+        df['ema26'] = trading_core.calculate_ema(close_prices, 26)
+        df['rsi'] = trading_core.calculate_rsi(close_prices, 14)
         
-        # MACD
-        df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
-        df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
+        # Calculate MACD
         df['macd'] = df['ema12'] - df['ema26']
-        df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+        df['signal'] = trading_core.calculate_ema(df['macd'].values.astype(np.float64), 9)
         
         return df
     
     def generate_signals(self, data):
         """
-        Generate buy/sell signals based on indicators
+        Generate buy/sell signals based on indicators using C extension
         
         Args:
             data (pd.DataFrame): Market data with indicators
@@ -119,18 +119,18 @@ class TradingBot:
         logger.info("Generating trading signals")
         df = data.copy()
         
-        # Initialize signal column
-        df['signal'] = 0
+        # Generate signals using C extension
+        crossover_signals = trading_core.generate_crossover_signals(
+            df['sma20'].values.astype(np.float64), 
+            df['sma50'].values.astype(np.float64)
+        )
         
-        # SMA crossover strategy
-        df['signal'] = np.where((df['sma20'] > df['sma50']) & 
-                               (df['sma20'].shift(1) <= df['sma50'].shift(1)), 1, df['signal'])  # Buy signal
-        df['signal'] = np.where((df['sma20'] < df['sma50']) & 
-                               (df['sma20'].shift(1) >= df['sma50'].shift(1)), -1, df['signal'])  # Sell signal
+        # Initialize signal column with crossover signals
+        df['signal'] = crossover_signals
         
-        # RSI overbought/oversold strategy
-        df['signal'] = np.where(df['rsi'] < 30, 1, df['signal'])  # Oversold -> Buy
-        df['signal'] = np.where(df['rsi'] > 70, -1, df['signal'])  # Overbought -> Sell
+        # RSI overbought/oversold logic (could also be moved to C)
+        df.loc[df['rsi'] < 30, 'signal'] = 1  # Oversold -> Buy
+        df.loc[df['rsi'] > 70, 'signal'] = -1  # Overbought -> Sell
         
         return df
     
@@ -185,7 +185,7 @@ class TradingBot:
     
     def risk_management(self, symbol, data):
         """
-        Apply risk management rules
+        Apply risk management rules using C extension
         
         Args:
             symbol (str): Trading pair symbol
@@ -194,28 +194,29 @@ class TradingBot:
         Returns:
             bool: True if trade passes risk checks
         """
-        # Check if we have enough capital
-        if self.capital < 1000:
-            logger.warning("Risk check failed: Insufficient capital")
-            return False
-        
-        # Check if volatility is acceptable
+        # Calculate volatility from recent data
         recent_data = data.tail(20)
         volatility = (recent_data['high'] - recent_data['low']).mean() / recent_data['close'].mean()
-        if volatility > 0.05:  # 5% volatility threshold
-            logger.warning(f"Risk check failed: Volatility too high ({volatility:.2%})")
+        
+        # Get current position value
+        current_price = data['close'].iloc[-1]
+        current_position = self.positions.get(symbol, 0)
+        position_value = current_position * current_price
+        
+        # Perform risk check using C extension
+        result, message = trading_core.check_risk(
+            self.capital,
+            position_value,
+            volatility,
+            self.max_position_percent,
+            self.max_volatility
+        )
+        
+        if result == 0:
+            logger.warning(f"Risk check failed: {message}")
             return False
         
-        # Position sizing (don't use more than 5% of capital per trade)
-        max_position_size = self.capital * 0.05
-        
-        # Check current exposure to this symbol
-        current_exposure = self.positions.get(symbol, 0) * data['close'].iloc[-1]
-        if current_exposure > max_position_size:
-            logger.warning(f"Risk check failed: Position size too large (${current_exposure:.2f})")
-            return False
-        
-        logger.info("Risk management checks passed")
+        logger.info(f"Risk management checks passed: {message}")
         return True
     
     def run_strategy(self, symbol, timeframe='1h'):
@@ -234,20 +235,20 @@ class TradingBot:
                 # Fetch latest market data
                 market_data = self.fetch_market_data(symbol, timeframe)
                 
-                # Calculate indicators
+                # Calculate indicators (using C extension)
                 data_with_indicators = self.calculate_indicators(market_data)
                 
-                # Generate signals
+                # Generate signals (using C extension)
                 data_with_signals = self.generate_signals(data_with_indicators)
                 
                 # Check the latest signal
                 latest_signal = data_with_signals['signal'].iloc[-1]
                 
-                # Apply risk management
+                # Apply risk management (using C extension)
                 if self.risk_management(symbol, data_with_signals) and latest_signal != 0:
-                    # Determine trade size (simplified)
+                    # Determine trade size
                     current_price = data_with_signals['close'].iloc[-1]
-                    trade_size = min(self.capital * 0.05 / current_price, 1.0)
+                    trade_size = min(self.capital * self.max_position_percent / current_price, 1.0)
                     
                     if latest_signal > 0:  # Buy signal
                         self.execute_trade(symbol, 'buy', trade_size)
@@ -288,7 +289,7 @@ class TradingBot:
         initial_capital = 10000  # Assuming default initial capital
         current_value = self.capital
         for symbol, quantity in self.positions.items():
-            # Get latest price for each symbol (simplified)
+            # Get latest price for each symbol
             latest_price = self.fetch_market_data(symbol, limit=1)['close'].iloc[-1]
             current_value += quantity * latest_price
         
